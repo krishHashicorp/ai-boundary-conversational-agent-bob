@@ -1,11 +1,19 @@
 # WatsonX + HCP Boundary AI Agent
 
-A conversational AI agent that connects to a remote Ubuntu host through **HCP Boundary** and executes shell commands on your behalf — powered by **IBM Granite** via WatsonX.ai.
+A WatsonX.ai-powered agent that connects to a remote Ubuntu host through **HCP Boundary** and executes shell commands — available in two modes:
+
+| Mode | Entry point | How it works |
+|------|-------------|-------------|
+| **Conversational** | `main.py` | Terminal REPL — you drive each turn interactively |
+| **Autonomous** | `main_autonomous.py` | Give it a goal — it plans, executes, and reports on its own |
+
+Both modes share the same underlying modules: `boundary_session.py`, `ssh_exec.py`, and `watsonx_llm.py`.
 
 ---
 
 ## Architecture
 
+### Conversational agent (`main.py`)
 ```
 main.py (chat REPL)
   └─▶ agent.py (ReAct loop — IBM Granite via WatsonX.ai)
@@ -15,9 +23,18 @@ main.py (chat REPL)
         └─▶ disconnect_from_host → ssh_exec + boundary_session          [explicit only]
 ```
 
-**Session model:** The agent connects once per chat session. All `run_command` calls reuse the same persistent SSH connection through the Boundary proxy tunnel — no reconnect between commands. The session is only torn down when you explicitly ask the agent to disconnect, say you're done, or exit the chat.
+### Autonomous agent (`main_autonomous.py`)
+```
+main_autonomous.py
+  └─▶ agent_autonomous.py
+        ├─▶ plan()        — LLM decomposes GOAL into ordered sub-tasks
+        ├─▶ execute()     — ReAct loop per sub-task (same tools as conversational)
+        └─▶ evaluate()    — LLM confirms whether the GOAL was fully achieved
+```
 
-**Credential injection:** The Ubuntu SSH password is stored in the HCP Boundary credential store and bound to the SSH target. The agent never handles the SSH password — Boundary injects it at the proxy layer. `paramiko` connects to the local proxy port with no credentials.
+**Session model:** The agent connects once. All `run_command` calls reuse the same persistent SSH connection through the Boundary proxy tunnel.
+
+**Credential injection:** The Ubuntu SSH password is stored in the HCP Boundary credential store. The agent never handles the SSH password — Boundary injects it at the proxy layer.
 
 ---
 
@@ -51,101 +68,90 @@ pip install -r requirements.txt
 
 ### 3. Configure credentials
 
-Copy `.env.example` to `.env` and fill in your values:
-
 ```bash
 cp .env.example .env
-```
-
-```dotenv
-# WatsonX.ai
-WATSONX_API_KEY=<your-ibm-cloud-api-key>
-WATSONX_PROJECT_ID=<your-watsonx-project-id>
-WATSONX_URL=https://us-south.ml.cloud.ibm.com
-WATSONX_MODEL_ID=ibm/granite-3-8b-instruct
-
-# HCP Boundary — user authentication
-BOUNDARY_ADDR=https://<cluster-id>.boundary.hashicorp.cloud
-BOUNDARY_AUTH_METHOD=password
-BOUNDARY_AUTH_METHOD_ID=ampw_<your-password-auth-method-id>
-BOUNDARY_LOGIN_NAME=<your-boundary-username>
-BOUNDARY_PASSWORD=<your-boundary-password>
-
-# HCP Boundary — SSH target (tssh_ prefix for SSH target types)
-BOUNDARY_TARGET_ID=tssh_<your-target-id>
-
-# SSH username on the Ubuntu host
-SSH_USERNAME=ubuntu
-```
-
-### 4. Verify connectivity
-
-```bash
-# Test Boundary authentication
-boundary authenticate password \
-  -auth-method-id=$BOUNDARY_AUTH_METHOD_ID \
-  -login-name=$BOUNDARY_LOGIN_NAME \
-  -password=$BOUNDARY_PASSWORD \
-  -format=json
-
-# Test Boundary SSH target
-boundary connect ssh -target-id=$BOUNDARY_TARGET_ID -style=none -format=json
+# Edit .env with your real values
 ```
 
 ---
 
-## Running the Agent
+## Running the Conversational Agent
+
+Open `ai-boundary-agent-conversational.code-workspace` in VS Code, or run directly:
 
 ```bash
 python main.py
+python main.py --auth oidc
 ```
-
-The terminal shows a `[connected ✓]` / `[disconnected]` indicator in the prompt.
-
-### Example conversation
 
 ```
 [disconnected] You: Connect to the host and show me disk usage
-Agent: Connected to the host. Disk usage:
+Agent: Connected. Disk usage:
   Filesystem      Size  Used Avail Use% Mounted on
   /dev/sda1        50G   12G   36G  25% /
 
 [connected ✓] You: Now check available memory
 Agent: Available memory: 3.2 GB free out of 8 GB total.
 
-[connected ✓] You: What are the top 5 CPU-consuming processes?
-Agent: The top 5 processes by CPU usage are:
-  1. python3  (12.4%)
-  2. nginx    (3.1%)
-  ...
+[connected ✓] You: Disconnect
+Agent: Disconnected.
+```
 
-[connected ✓] You: Disconnect and summarise what you found
-Agent: Disk is healthy (25% used), memory is comfortable (3.2 GB free),
-and the host is lightly loaded. Disconnected.
+---
+
+## Running the Autonomous Agent
+
+Open `ai-boundary-agent-autonomous.code-workspace` in VS Code, or run directly:
+
+```bash
+python main_autonomous.py "Audit disk usage, memory, and top CPU processes, then report"
+python main_autonomous.py --auth oidc "Check if nginx is running and report its status"
+```
+
+The agent prints its plan before executing, then shows each sub-task result as it completes:
+
+```
+──────────── WatsonX + HCP Boundary Autonomous Agent ────────────
+Auth: password · Mode: autonomous
+
+Goal: Audit disk usage, memory, and top CPU processes, then report
+
+──────────────────────────── Plan ───────────────────────────────
+  1. Connect to the host
+  2. Check disk usage on all mount points
+  3. Check available memory
+  4. List top 5 CPU-consuming processes
+  5. Disconnect from the host
+
+──────────── Step 1 — Connect to the host ───────────────────────
+Connected. Boundary session active. SSH connected as mock-ai-agent-linux.
+
+──────────── Step 2 — Check disk usage on all mount points ──────
+/dev/sda1: 50G total, 12G used (25%), 36G free.
+
+... (steps 3–5) ...
+
+──────────────────────────── Summary ────────────────────────────
+ Sub-task                              Result
+ Connect to the host                   Connected successfully.
+ Check disk usage on all mount points  /dev/sda1: 25% used, 36G free.
+ Check available memory                3.2 GB free of 8 GB total.
+ List top 5 CPU-consuming processes    python3 12.4%, nginx 3.1%, ...
+ Disconnect from the host              Disconnected.
+
+✓ Goal achieved: All audit tasks completed successfully.
 ```
 
 ---
 
 ## Switching to OIDC Authentication
 
-OIDC replaces your Boundary username/password with browser-based SSO (Okta, Azure AD, Google, etc.).
-
-### HCP Boundary setup (one-time)
-
-1. In the HCP Boundary admin UI, go to **Auth Methods → New → OIDC**
-2. Configure your IdP (issuer URL, client ID, client secret)
-3. Note the generated **auth method ID** (starts with `amoidc_`)
-
-### Agent configuration
-
-Add the OIDC auth method ID to `.env` and switch the method:
-
 ```dotenv
 BOUNDARY_AUTH_METHOD=oidc
 BOUNDARY_OIDC_AUTH_METHOD_ID=amoidc_<your-oidc-method-id>
 ```
 
-When you next run `python main.py` and ask the agent to connect, a browser window will open for you to log in. The token is cached automatically.
+A browser window will open for SSO login. No code changes required.
 
 ---
 
@@ -165,16 +171,30 @@ All tests are offline — no live Boundary or WatsonX calls required.
 ai-boundary-agent/
 ├── src/
 │   └── agent/
-│       ├── watsonx_llm.py       # WatsonX.ai IBM Granite wrapper
-│       ├── boundary_session.py  # HCP Boundary session lifecycle
-│       ├── ssh_exec.py          # Persistent paramiko SSH connection
-│       └── agent.py             # ReAct agent loop + tool definitions
+│       ├── watsonx_llm.py            # WatsonX.ai IBM Granite wrapper       [shared]
+│       ├── boundary_session.py       # HCP Boundary session lifecycle        [shared]
+│       ├── ssh_exec.py               # Persistent paramiko SSH connection    [shared]
+│       ├── agent.py                  # Conversational ReAct loop
+│       └── agent_autonomous.py       # Autonomous plan→execute→evaluate loop
 ├── tests/
 │   ├── test_watsonx_llm.py
 │   ├── test_boundary_session.py
 │   └── test_ssh_exec.py
-├── main.py                      # Terminal chat entry point
+├── main.py                           # Conversational REPL entry point
+├── main_autonomous.py                # Autonomous agent entry point
+├── ai-boundary-agent-conversational.code-workspace
+├── ai-boundary-agent-autonomous.code-workspace
 ├── .env.example
 ├── requirements.txt
+├── ARCHITECTURE.md
 └── README.md
 ```
+
+---
+
+## Branch Strategy
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Conversational agent — stable, production-ready |
+| `autonomous-agent` | Autonomous agent development — `agent_autonomous.py` + `main_autonomous.py` |
