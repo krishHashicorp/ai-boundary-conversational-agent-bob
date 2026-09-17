@@ -5,6 +5,7 @@ ReAct (Reason + Act) agent loop powered by IBM Granite via WatsonX.ai.
 Tools available to the agent:
   - connect_to_host         Open Boundary session + SSH (idempotent)
   - run_command             Execute a shell command on the connected host
+  - run_boundary_command    Run a read-only Boundary CLI command locally
   - check_connection_status Report whether Boundary + SSH are active
   - disconnect_from_host    Close SSH + Boundary session
 
@@ -56,6 +57,29 @@ TOOLS: list[dict] = [
         "name": "check_connection_status",
         "description": "Check whether the Boundary proxy and SSH connection are currently active.",
         "parameters": {},
+    },
+    {
+        "name": "run_boundary_command",
+        "description": (
+            "Run a read-only Boundary CLI command on the local machine (where the agent runs). "
+            "Use this for questions about Boundary itself — listing sessions, targets, hosts, "
+            "scopes, users, workers, credentials, etc. "
+            "Do NOT use run_command for Boundary queries — that runs on the remote SSH host. "
+            "Only read-only subcommands are permitted (list, read). "
+            "Mutating actions (create, update, delete, etc.) are blocked."
+        ),
+        "parameters": {
+            "args": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "CLI arguments after 'boundary'. "
+                    "Examples: [\"sessions\", \"list\"], "
+                    "[\"targets\", \"list\", \"-scope-id=global\"], "
+                    "[\"sessions\", \"read\", \"-id=s-abc123\"]"
+                ),
+            }
+        },
     },
     {
         "name": "disconnect_from_host",
@@ -145,6 +169,22 @@ def execute_tool(tool_name: str, args: dict) -> str:
             f"Boundary proxy: {'active' if boundary_ok else 'not connected'}. "
             f"SSH: {'active' if ssh_ok else 'not connected'}."
         )
+
+    if tool_name == "run_boundary_command":
+        cmd_args = args.get("args", [])
+        if isinstance(cmd_args, str):
+            # LLM occasionally serialises args as a space-separated string
+            cmd_args = cmd_args.split()
+        try:
+            result = boundary_session.run_boundary_command(cmd_args)
+        except (ValueError, TimeoutError) as exc:
+            return f"Error: {exc}"
+        parts = [f"exit_code={result['exit_code']}"]
+        if result["stdout"]:
+            parts.append(f"stdout:\n{result['stdout']}")
+        if result["stderr"]:
+            parts.append(f"stderr:\n{result['stderr']}")
+        return "\n".join(parts)
 
     if tool_name == "disconnect_from_host":
         ssh_exec.disconnect()

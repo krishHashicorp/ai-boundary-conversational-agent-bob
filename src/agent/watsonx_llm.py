@@ -7,6 +7,8 @@ formatting is handled by the SDK per-model — no manual chat templates needed.
 """
 
 import os
+import time
+import random
 from dotenv import load_dotenv
 from ibm_watsonx_ai import Credentials
 from ibm_watsonx_ai.foundation_models import ModelInference
@@ -44,12 +46,19 @@ def _get_model() -> ModelInference:
     return _model
 
 
+# Retry settings for 429 / consumption_limit_reached responses
+_MAX_RETRIES = 5
+_BACKOFF_BASE = 5   # seconds — doubled on each retry
+_BACKOFF_CAP  = 60  # maximum wait between retries
+
+
 def chat(messages: list[dict]) -> str:
     """
     Send a conversation history to WatsonX.ai and return the assistant reply.
 
     Prepends a system message if the caller hasn't supplied one.
     Uses the SDK's /ml/v1/text/chat endpoint — no manual prompt templating.
+    Retries up to _MAX_RETRIES times with exponential backoff on 429 errors.
 
     Args:
         messages: list of {"role": "user"|"assistant"|"system", "content": str}
@@ -62,8 +71,24 @@ def chat(messages: list[dict]) -> str:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(messages)
 
     model = _get_model()
-    response = model.chat(messages=messages)
-    return response["choices"][0]["message"]["content"].strip()
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            response = model.chat(messages=messages)
+            return response["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            err = str(exc)
+            is_rate_limit = "429" in err or "consumption_limit_reached" in err
+            if is_rate_limit and attempt < _MAX_RETRIES:
+                wait = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_CAP)
+                # Add ±20 % jitter to avoid thundering-herd when multiple
+                # sub-tasks retry at the same moment
+                wait = wait * (0.8 + 0.4 * random.random())
+                print(f"[watsonx] Rate limit hit — retrying in {wait:.1f}s "
+                      f"(attempt {attempt + 1}/{_MAX_RETRIES}) …")
+                time.sleep(wait)
+            else:
+                raise
 
 
 if __name__ == "__main__":

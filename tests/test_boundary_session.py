@@ -5,6 +5,7 @@ Unit tests for the HCP Boundary session manager.
 
 import json
 import os
+import subprocess
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,66 @@ def reset_session_state():
     yield
     bs._session_proc = None
     bs._session_info = None
+
+
+class TestAuthenticate:
+    @patch("src.agent.boundary_session.authenticate_password")
+    @patch("src.agent.boundary_session.authenticate_oidc")
+    def test_skips_auth_when_token_already_set(self, mock_oidc, mock_password):
+        os.environ["BOUNDARY_TOKEN"] = "tok_already_present"
+        try:
+            bs.authenticate()
+            mock_password.assert_not_called()
+            mock_oidc.assert_not_called()
+        finally:
+            del os.environ["BOUNDARY_TOKEN"]
+
+    @patch("src.agent.boundary_session.authenticate_password")
+    def test_calls_password_auth_when_no_token(self, mock_password):
+        os.environ.pop("BOUNDARY_TOKEN", None)
+        os.environ["BOUNDARY_AUTH_METHOD"] = "password"
+        bs.authenticate()
+        mock_password.assert_called_once()
+
+
+class TestAuthenticateOidc:
+    @patch("src.agent.boundary_session.subprocess.run")
+    def test_sets_boundary_token_from_stdout(self, mock_run):
+        """authenticate_oidc reads the token from stdout JSON (Boundary CLI v0.21+)."""
+        import json as _json
+
+        token_data = _json.dumps({"item": {"attributes": {"token": "tok_oidc_xyz"}}})
+
+        mock_result = MagicMock()
+        mock_result.stdout = token_data
+        mock_run.return_value = mock_result
+
+        os.environ.pop("BOUNDARY_TOKEN", None)
+
+        bs.authenticate_oidc()
+
+        assert os.environ.get("BOUNDARY_TOKEN") == "tok_oidc_xyz"
+
+    @patch("src.agent.boundary_session.subprocess.run")
+    def test_stderr_not_redirected(self, mock_run):
+        """stderr must be left as None (terminal) so the browser callback URL stays visible."""
+        import json as _json
+
+        token_data = _json.dumps({"item": {"attributes": {"token": "tok_oidc_abc"}}})
+
+        def fake_run(cmd, **kwargs):
+            # Assert stderr was NOT redirected — browser URL must remain visible
+            assert kwargs.get("stderr") is None
+            # Assert stdout IS captured so we can read the token JSON
+            assert kwargs.get("stdout") == subprocess.PIPE
+            mock_result = MagicMock()
+            mock_result.stdout = token_data
+            return mock_result
+
+        mock_run.side_effect = fake_run
+        os.environ.pop("BOUNDARY_TOKEN", None)
+
+        bs.authenticate_oidc()
 
 
 class TestAuthenticatePassword:
@@ -90,6 +151,36 @@ class TestConnect:
         mock_popen.return_value = self._make_mock_proc()
         bs.connect("tssh_test")
         assert bs.is_connected() is True
+
+
+class TestCheckCancelled:
+    def test_no_proc_does_not_raise(self):
+        """check_cancelled() is silent when there is no active session."""
+        bs._session_proc = None
+        bs.check_cancelled()  # must not raise
+
+    def test_running_proc_does_not_raise(self):
+        """check_cancelled() is silent while the proxy process is still alive."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # process still running
+        bs._session_proc = mock_proc
+        bs.check_cancelled()  # must not raise
+
+    def test_exited_proc_raises_cancelled_error(self):
+        """check_cancelled() raises BoundarySessionCancelledError when the process has exited."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # process exited (e.g. admin cancelled)
+        bs._session_proc = mock_proc
+        with pytest.raises(bs.BoundarySessionCancelledError, match="cancelled externally by the admin"):
+            bs.check_cancelled()
+
+    def test_zero_exit_also_raises(self):
+        """Any exited process (even exit 0) is treated as an external cancellation."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        bs._session_proc = mock_proc
+        with pytest.raises(bs.BoundarySessionCancelledError):
+            bs.check_cancelled()
 
 
 class TestDisconnect:

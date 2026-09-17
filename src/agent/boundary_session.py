@@ -17,7 +17,12 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dotenv import load_dotenv
+
+
+class BoundarySessionCancelledError(RuntimeError):
+    """Raised when the Boundary session is cancelled externally (e.g. by an admin)."""
 
 load_dotenv()
 
@@ -96,38 +101,38 @@ def authenticate_password() -> None:
 def authenticate_oidc() -> None:
     """
     Authenticate to HCP Boundary using OIDC (browser-based SSO).
-    Blocks until the browser flow completes.
+    Blocks until the human completes the browser flow (IBM Verify + MFA).
     Sets the BOUNDARY_TOKEN environment variable.
 
-    NOTE: stdout must NOT be captured so the boundary CLI can open the
-    browser and print the callback URL to the terminal. We redirect only
-    stderr to PIPE so we can surface errors without interfering with the
-    browser flow. The token JSON is written to a temp file via -output-file.
+    Boundary CLI v0.19–0.20: token written to -output-file (temp file).
+    Boundary CLI v0.21+:     -output-file removed; token JSON is written to
+                             stdout with -format=json; the browser callback
+                             URL and progress messages go to stderr so the
+                             human sees them in the terminal.
+
+    We capture stdout to extract the token. stderr is left as-is (inherited)
+    so the browser URL and login progress remain visible to the operator.
+
+    -keyring-type=none   — skip OS keychain; we own the token lifetime
+    -token-name=none     — don't persist a named token entry in the keyring
     """
-    import tempfile, pathlib
-
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        subprocess.run(
-            [
-                "boundary", "authenticate", "oidc",
-                f"-addr={os.environ['BOUNDARY_ADDR']}",
-                f"-auth-method-id={os.environ['BOUNDARY_OIDC_AUTH_METHOD_ID']}",
-                f"-token-name=none",
-                f"-format=json",
-                f"-keyring-type=none",
-            ],
-            stdout=open(tmp_path, "w"),
-            text=True,
-            check=True,
-        )
-        data = json.loads(pathlib.Path(tmp_path).read_text())
-        token = data["item"]["attributes"]["token"]
-        os.environ["BOUNDARY_TOKEN"] = token
-    finally:
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
+    result = subprocess.run(
+        [
+            "boundary", "authenticate", "oidc",
+            f"-addr={os.environ['BOUNDARY_ADDR']}",
+            f"-auth-method-id={os.environ['BOUNDARY_OIDC_AUTH_METHOD_ID']}",
+            "-keyring-type=none",
+            "-token-name=none",
+            "-format=json",
+        ],
+        stdout=subprocess.PIPE,
+        # stderr intentionally not captured — browser URL must stay visible
+        text=True,
+        check=True,
+    )
+    data = json.loads(result.stdout)
+    token = data["item"]["attributes"]["token"]
+    os.environ["BOUNDARY_TOKEN"] = token
 
 
 def authenticate() -> None:
@@ -135,7 +140,14 @@ def authenticate() -> None:
     Authenticate to HCP Boundary using the method configured by BOUNDARY_AUTH_METHOD
     env var (defaults to 'password'). Dispatches to authenticate_password() or
     authenticate_oidc().
+
+    Skipped entirely if BOUNDARY_TOKEN is already set in the environment — this
+    allows a human to pre-authenticate via OIDC (browser + MFA) once and then
+    hand off to the agent without triggering a second browser flow.
     """
+    if os.environ.get("BOUNDARY_TOKEN"):
+        return
+
     method = os.environ.get("BOUNDARY_AUTH_METHOD", "password").lower()
     if method == "oidc":
         authenticate_oidc()
@@ -152,6 +164,25 @@ def is_connected() -> bool:
     return _session_proc is not None and _session_proc.poll() is None
 
 
+def check_cancelled() -> None:
+    """
+    Raise BoundarySessionCancelledError if the Boundary proxy process has exited
+    unexpectedly — i.e. the session was cancelled from outside (e.g. by an admin
+    terminating the session in the Boundary control plane).
+
+    A non-zero return code indicates an external cancellation rather than a clean
+    disconnect initiated by this process (which sets _session_proc to None first).
+    """
+    if _session_proc is not None and _session_proc.poll() is not None:
+        raise BoundarySessionCancelledError(
+            "Boundary session has been cancelled externally by the admin."
+        )
+
+
+# How long (seconds) to wait for `boundary connect` to emit its JSON line.
+_CONNECT_TIMEOUT = int(os.environ.get("BOUNDARY_CONNECT_TIMEOUT", "30"))
+
+
 def connect(target_id: str) -> dict:
     """
     Open an HCP Boundary session to the given SSH target using credential injection.
@@ -165,6 +196,11 @@ def connect(target_id: str) -> dict:
 
     Returns:
         dict with keys: host (str), port (int), session_id (str)
+
+    Raises:
+        TimeoutError: if the process does not emit the JSON line within
+                      BOUNDARY_CONNECT_TIMEOUT seconds (default 30).
+        RuntimeError: if the process exits before emitting the JSON line.
     """
     global _session_proc, _session_info
 
@@ -188,9 +224,49 @@ def connect(target_id: str) -> dict:
         env=env,
     )
 
-    # The first line of stdout is the JSON connection info
+    # Drain stderr in a background thread to prevent the OS pipe buffer from
+    # filling up and deadlocking the boundary process before it writes to stdout.
+    stderr_lines: list[str] = []
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    # Read the first stdout line (the JSON connection info) with a timeout so
+    # that a hanging boundary process does not block the caller indefinitely.
     assert proc.stdout is not None
-    first_line = proc.stdout.readline()
+    first_line: str | None = None
+
+    def _read_first_line() -> None:
+        nonlocal first_line
+        first_line = proc.stdout.readline()  # type: ignore[union-attr]
+
+    reader_thread = threading.Thread(target=_read_first_line, daemon=True)
+    reader_thread.start()
+    reader_thread.join(timeout=_CONNECT_TIMEOUT)
+
+    if reader_thread.is_alive():
+        # Timed out — kill the process and surface a clear error.
+        proc.kill()
+        proc.wait()
+        raise TimeoutError(
+            f"boundary connect did not respond within {_CONNECT_TIMEOUT}s "
+            f"for target '{target_id}'. "
+            f"stderr: {''.join(stderr_lines).strip() or '(empty)'}"
+        )
+
+    if not first_line:
+        # Process exited without writing anything useful.
+        rc = proc.wait()
+        raise RuntimeError(
+            f"boundary connect exited with code {rc} before emitting connection info. "
+            f"stderr: {''.join(stderr_lines).strip() or '(empty)'}"
+        )
+
     data = json.loads(first_line)
 
     # Extract injected credentials if Boundary provided them
@@ -232,6 +308,86 @@ def disconnect() -> None:
 
     _session_proc = None
     _session_info = None
+
+
+# ---------------------------------------------------------------------------
+# Local Boundary CLI execution
+# ---------------------------------------------------------------------------
+
+# Boundary subcommands that are read-only / safe to run without extra confirmation.
+# Any subcommand not in this set is rejected.
+_BOUNDARY_ALLOWED_SUBCOMMANDS: frozenset[str] = frozenset([
+    "sessions", "targets", "hosts", "host-sets", "host-catalogs",
+    "scopes", "users", "groups", "roles", "auth-methods", "auth-tokens",
+    "accounts", "managed-groups", "workers", "credentials",
+    "credential-stores", "credential-libraries",
+])
+
+# Boundary actions that mutate state — blocked even for allowed subcommands.
+_BOUNDARY_BLOCKED_ACTIONS: frozenset[str] = frozenset([
+    "create", "update", "delete", "set-grants", "add-grants", "remove-grants",
+    "set-principals", "add-principals", "remove-principals",
+    "set-hosts", "add-hosts", "remove-hosts",
+    "set-host-sets", "add-host-sets", "remove-host-sets",
+    "authorize-session", "cancel",
+])
+
+_BOUNDARY_CMD_TIMEOUT = int(os.environ.get("BOUNDARY_CMD_TIMEOUT", "15"))
+
+
+def run_boundary_command(args: list[str]) -> dict:
+    """
+    Run a read-only Boundary CLI command locally and return its output.
+
+    Only subcommands in _BOUNDARY_ALLOWED_SUBCOMMANDS are permitted.
+    Mutating actions (_BOUNDARY_BLOCKED_ACTIONS) are rejected regardless
+    of the subcommand.
+
+    Args:
+        args: CLI arguments after 'boundary', e.g. ['sessions', 'list', '-format=json']
+
+    Returns:
+        dict with keys: stdout (str), stderr (str), exit_code (int)
+
+    Raises:
+        ValueError: if the subcommand or action is not permitted.
+        TimeoutError: if the command does not complete within BOUNDARY_CMD_TIMEOUT seconds.
+    """
+    if not args:
+        raise ValueError("No Boundary subcommand provided.")
+
+    subcommand = args[0].lstrip("-")
+    if subcommand not in _BOUNDARY_ALLOWED_SUBCOMMANDS:
+        raise ValueError(
+            f"Boundary subcommand '{subcommand}' is not permitted. "
+            f"Allowed: {sorted(_BOUNDARY_ALLOWED_SUBCOMMANDS)}"
+        )
+
+    # Check all positional tokens for blocked actions
+    for token in args[1:]:
+        if not token.startswith("-") and token in _BOUNDARY_BLOCKED_ACTIONS:
+            raise ValueError(
+                f"Boundary action '{token}' is blocked. "
+                "Only read-only actions (list, read) are permitted."
+            )
+
+    # Always inject -format=json if not already present
+    if not any(a.startswith("-format") for a in args):
+        args = list(args) + ["-format=json"]
+
+    env = {**os.environ}
+    result = subprocess.run(
+        ["boundary"] + args,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=_BOUNDARY_CMD_TIMEOUT,
+    )
+    return {
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exit_code": result.returncode,
+    }
 
 
 # Ensure the session is cleaned up if Python exits unexpectedly

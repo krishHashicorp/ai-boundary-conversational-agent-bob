@@ -33,7 +33,10 @@ _READ_CHUNK = 4096
 # Matches ANSI/VT100 escape sequences
 _ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
-# Matches a shell prompt line: anything ending in "$ " (bash/sh/custom prompts)
+# Matches a shell prompt line: anything ending in "$ " (bash/sh/custom prompts).
+# Anchored to the *last* non-empty line only — checked after stripping ANSI —
+# so a $ appearing in the middle of large command output (e.g. ps aux) does
+# not produce a false-positive early return.
 _PROMPT_RE = re.compile(r"^.*\$\s*$", re.MULTILINE)
 
 
@@ -114,8 +117,15 @@ def connect(host: str, port: int, username: str, password: str | None = None) ->
 
 def _read_until_prompt(ch: paramiko.Channel, timeout: float = _READ_TIMEOUT) -> str:
     """
-    Read from the channel until a shell prompt line (ending in '$ ') appears or timeout.
-    Returns the full ANSI-stripped output including the prompt line.
+    Read from the channel until a shell prompt line (ending in '$ ') appears
+    on the *last* non-empty line, or until timeout expires.
+
+    Checking only the last non-empty line avoids false positives from command
+    output that happens to contain a '$' (e.g. ps aux command columns, shell
+    variable names in scripts, etc.) which previously caused premature returns
+    and truncated output for long-running commands like `ps aux`.
+
+    Returns the full ANSI-stripped buffer.
     """
     buf = ""
     deadline = time.monotonic() + timeout
@@ -129,7 +139,12 @@ def _read_until_prompt(ch: paramiko.Channel, timeout: float = _READ_TIMEOUT) -> 
         except socket.timeout:
             pass
         cleaned = _strip_ansi(buf)
-        if _PROMPT_RE.search(cleaned):
+        # Only test the last non-empty line to avoid mid-output false positives
+        last_line = next(
+            (ln for ln in reversed(cleaned.splitlines()) if ln.strip()),
+            "",
+        )
+        if _PROMPT_RE.match(last_line):
             return cleaned
     return _strip_ansi(buf)
 
@@ -160,7 +175,7 @@ def _extract_output(raw: str, command: str) -> tuple[str, int]:
     return "\n".join(output_lines).strip(), 0
 
 
-def run_command(command: str) -> dict:
+def run_command(command: str, timeout: float = _READ_TIMEOUT) -> dict:
     """
     Execute a shell command on the persistent interactive shell and return output.
 
@@ -170,12 +185,17 @@ def run_command(command: str) -> dict:
 
     Args:
         command: Shell command to run on the remote host.
+        timeout: Seconds to wait for the command to complete (default: _READ_TIMEOUT).
+                 Raise RuntimeError if the sentinel is not seen within this time.
 
     Returns:
         dict with keys:
             stdout (str):    Command output (stdout + stderr merged by PTY), ANSI-stripped
             stderr (str):    Always empty — PTY merges stderr into stdout
             exit_code (int): Exit status of the command
+
+    Raises:
+        RuntimeError: if the command does not complete within `timeout` seconds.
     """
     if _shell is None or not is_connected():
         raise RuntimeError("SSH shell is not connected. Call connect() first.")
@@ -189,7 +209,7 @@ def run_command(command: str) -> dict:
     _shell.sendall(f"{command} ; echo {sentinel}$?\n".encode())
 
     # Read until the prompt appears after the sentinel line
-    raw = _read_until_prompt(_shell, timeout=_READ_TIMEOUT)
+    raw = _read_until_prompt(_shell, timeout=timeout)
 
     lines = raw.splitlines()
 
@@ -217,10 +237,16 @@ def run_command(command: str) -> dict:
 
     output_lines = lines[start_idx:end_idx]
 
+    if not found:
+        raise RuntimeError(
+            f"Command did not complete within {timeout}s (sentinel not seen). "
+            f"Partial output: {chr(10).join(output_lines).strip()[:200]!r}"
+        )
+
     return {
         "stdout": "\n".join(output_lines).strip(),
         "stderr": "",   # PTY merges stderr into stdout
-        "exit_code": exit_code if found else 0,
+        "exit_code": exit_code,
     }
 
 

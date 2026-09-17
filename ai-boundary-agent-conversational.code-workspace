@@ -1,0 +1,49 @@
+{
+  "folders": [
+    {
+      "name": "ai-boundary-agent-conversational",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "editor.formatOnSave": true,
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      ".venv": true,
+      "node_modules": true
+    }
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Run Conversational Agent",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/main.py",
+        "console": "integratedTerminal",
+        "justMyCode": true
+      },
+      {
+        "name": "Run Conversational Agent (OIDC)",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/main.py",
+        "args": ["--auth", "oidc"],
+        "console": "integratedTerminal",
+        "justMyCode": true
+      }
+    ]
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.debugpy",
+      "ms-python.pylance",
+      "charliermarsh.ruff"
+    ]
+  }
+}
